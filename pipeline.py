@@ -44,7 +44,8 @@ def db():
         con.execute("ALTER TABLE accounts ADD COLUMN thumbs TEXT")
     if "active_days_7d" not in cols:
         con.execute("ALTER TABLE accounts ADD COLUMN active_days_7d INTEGER")
-    for name, kind in (("enrich_stage", "TEXT"), ("thumb_jobs", "TEXT")):
+    for name, kind in (("enrich_stage", "TEXT"), ("thumb_jobs", "TEXT"),
+                       ("manual_decision", "INTEGER"), ("manual_reviewed_at", "TEXT")):
         if name not in cols:
             con.execute(f"ALTER TABLE accounts ADD COLUMN {name} {kind}")
     con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
@@ -364,7 +365,8 @@ def enrich(con, args):
 
 def expand(con, args):
     new = 0
-    where = "is_fal_page=1 AND is_daily=1 AND is_text_based=1" if CFG.get("expand_from") == "daily_text" else "is_fal_page=1"
+    ai_where = "is_fal_page=1 AND is_daily=1 AND is_text_based=1" if CFG.get("expand_from") == "daily_text" else "is_fal_page=1"
+    where = f"(manual_decision=1 OR (manual_decision IS NULL AND {ai_where}))"
     rows = con.execute(f"SELECT username,user_id FROM accounts WHERE {where} AND expanded=0 LIMIT ?",
                        (args.limit,)).fetchall()
     if not rows:
@@ -552,7 +554,8 @@ def classify(con, args):
 
 # ---------------------------------------------------------------- output
 COLS = ["username", "full_name", "followers", "active_days_7d", "posts_per_week", "photo_share", "last_post_at",
-        "is_fal_page", "is_daily", "is_text_based", "fal_types", "confidence", "reason", "bio", "source"]
+        "is_fal_page", "is_daily", "is_text_based", "fal_types", "confidence", "reason", "bio", "source",
+        "manual_decision", "manual_reviewed_at"]
 
 def export(con, args):
     def write(name, where):
@@ -562,15 +565,16 @@ def export(con, args):
             for r in rows: w.writerow(list(r) + [f"https://instagram.com/{r['username']}"])
         log(f"{name}: {len(rows)} rows")
         return len(rows)
-    a = write("fal_pages.csv", "WHERE is_fal_page=1 AND is_daily=1 AND is_text_based=1")
+    a = write("fal_pages.csv", "WHERE manual_decision=1")
+    suggested = write("ai_candidates.csv", "WHERE is_fal_page=1 AND is_daily=1 AND is_text_based=1")
     b = write("all_accounts.csv", "")
-    summary(f"خروجی ساخته شد: {a} فال روزانه‌ی متنی در fal_pages.csv، {b} صفحه در all_accounts.csv")
+    summary(f"خروجی ساخته شد: {a} منتخب دستی در fal_pages.csv، {suggested} پیشنهاد AI در ai_candidates.csv، {b} صفحه در all_accounts.csv")
 
 def status(con, args):
     for r in con.execute("SELECT status, COUNT(*) n FROM accounts GROUP BY status"):
         print(f"{r['status']:>11}: {r['n']}")
-    n = con.execute("SELECT COUNT(*) FROM accounts WHERE is_fal_page=1 AND is_daily=1 AND is_text_based=1").fetchone()[0]
-    print(f"daily text fal pages: {n}")
+    n = con.execute("SELECT COUNT(*) FROM accounts WHERE manual_decision=1").fetchone()[0]
+    print(f"manually selected pages: {n}")
 
 STAGE_FA = {"discover": "پیدا کردن صفحه‌های جدید از هشتگ‌ها و جستجو",
             "enrich": "گرفتن پروفایل و ۲ پست آخر هر صفحه",

@@ -1,8 +1,11 @@
 """Mini GUI for pipeline.py - double-click gui.bat (or gui.pyw)."""
 import os, sys, json, sqlite3, subprocess, threading, queue
+from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 from pathlib import Path
+from PIL import Image, ImageOps, ImageTk
+from pipeline import db as open_db, thumbnail_paths
 
 HERE = Path(__file__).resolve().parent
 DB = HERE / "fal.db"
@@ -61,11 +64,16 @@ class App(tk.Tk):
         self.buttons = []
 
         nb = ttk.Notebook(self); nb.pack(fill="both", expand=True, padx=6, pady=6)
-        run_tab = ttk.Frame(nb); set_tab = ttk.Frame(nb)
-        nb.add(run_tab, text="  اجرا  "); nb.add(set_tab, text="  تنظیمات  ")
+        run_tab = ttk.Frame(nb); manual_tab = ttk.Frame(nb); set_tab = ttk.Frame(nb)
+        nb.add(run_tab, text="  اجرا  ")
+        nb.add(manual_tab, text="  منوال  ")
+        nb.add(set_tab, text="  تنظیمات  ")
         self.build_run(run_tab)
+        self.build_manual(manual_tab)
         self.build_settings(set_tab)
+        nb.bind("<<NotebookTabChanged>>", lambda event: self.load_manual() if nb.select() == str(manual_tab) else None)
 
+        open_db().close()
         self.refresh_status()
         self.after(200, self.pump)
 
@@ -101,10 +109,145 @@ class App(tk.Tk):
         self.stop_btn = ttk.Button(opts, text="■  توقف", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left")
         ttk.Button(opts, text="باز کردن نتیجه", command=self.open_results).pack(side="left", padx=6)
+        ttk.Button(opts, text="همهٔ صفحه‌ها", command=self.open_all_results).pack(side="left", padx=6)
         ttk.Button(opts, text="پوشه‌ی تصویرها", command=lambda: self.open_path(HERE / "thumbs")).pack(side="left")
 
         self.log = scrolledtext.ScrolledText(root, height=12, font=("Consolas", 9), state="disabled")
         self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    # ================================================================ manual review
+    def build_manual(self, root):
+        self.manual_page = 0
+        self.manual_page_size = 12
+        self.manual_images = []
+        top = ttk.Frame(root, padding=10); top.pack(fill="x")
+        self.manual_filter = tk.StringVar(value="بررسی‌نشده")
+        ttk.Label(top, text="نمایش:", font=FONT).pack(side="right")
+        filters = ttk.Combobox(top, textvariable=self.manual_filter, state="readonly", width=16,
+                               values=("بررسی‌نشده", "تأییدشده", "ردشده", "همه"))
+        filters.pack(side="right", padx=6)
+        filters.bind("<<ComboboxSelected>>", lambda event: self.change_manual_filter())
+        ttk.Button(top, text="تازه‌سازی", command=self.load_manual).pack(side="right", padx=6)
+        ttk.Button(top, text="خروجی منتخب‌ها", command=self.open_selected).pack(side="left")
+
+        self.manual_status = tk.StringVar(value="")
+        ttk.Label(root, textvariable=self.manual_status, font=FONT, anchor="e").pack(fill="x", padx=12)
+        navigation = ttk.Frame(root, padding=(10, 4)); navigation.pack(fill="x")
+        ttk.Button(navigation, text="صفحهٔ بعد ←", command=lambda: self.change_manual_page(1)).pack(side="left")
+        ttk.Button(navigation, text="→ صفحهٔ قبل", command=lambda: self.change_manual_page(-1)).pack(side="left", padx=5)
+
+        canvas = tk.Canvas(root, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.manual_canvas = canvas
+        self.manual_body = ttk.Frame(canvas, padding=10)
+        window = canvas.create_window((0, 0), window=self.manual_body, anchor="nw")
+        self.manual_body.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+
+    def change_manual_filter(self):
+        self.manual_page = 0
+        self.load_manual()
+
+    def change_manual_page(self, step):
+        self.manual_page = max(0, self.manual_page + step)
+        self.load_manual()
+
+    def load_manual(self):
+        for child in self.manual_body.winfo_children():
+            child.destroy()
+        self.manual_images = []
+        filters = {"بررسی‌نشده": "manual_decision IS NULL", "تأییدشده": "manual_decision=1",
+                   "ردشده": "manual_decision=0", "همه": "1=1"}
+        where = "thumbs IS NOT NULL AND thumbs <> '[]' AND " + filters[self.manual_filter.get()]
+        try:
+            con = open_db()
+            try:
+                total = con.execute(f"SELECT COUNT(*) FROM accounts WHERE {where}").fetchone()[0]
+                if self.manual_page * self.manual_page_size >= total and self.manual_page:
+                    self.manual_page = max(0, (total - 1) // self.manual_page_size)
+                rows = con.execute(f"""SELECT username, full_name, followers, active_days_7d,
+                    is_fal_page, is_daily, is_text_based, thumbs, manual_decision
+                    FROM accounts WHERE {where}
+                    ORDER BY CASE WHEN is_fal_page=1 AND is_daily=1 AND is_text_based=1 THEN 0
+                                  WHEN status='classified' THEN 1 ELSE 2 END,
+                             followers DESC, username
+                    LIMIT ? OFFSET ?""",
+                    (self.manual_page_size, self.manual_page * self.manual_page_size)).fetchall()
+                selected = con.execute("SELECT COUNT(*) FROM accounts WHERE manual_decision=1").fetchone()[0]
+            finally:
+                con.close()
+            first = self.manual_page * self.manual_page_size + 1 if rows else 0
+            self.manual_status.set(f"نمایش {first} تا {first + len(rows) - 1 if rows else 0} از {total} صفحه  |  منتخب‌ها: {selected}")
+            for row in rows:
+                self.manual_card(row)
+            if not rows:
+                ttk.Label(self.manual_body, text="صفحه‌ای برای این نمایش نیست", font=FONT).pack(pady=25)
+            self.manual_canvas.yview_moveto(0)
+        except Exception as e:
+            self.manual_status.set(f"خواندن صفحه‌ها ناموفق بود: {e}")
+
+    def manual_card(self, row):
+        card = ttk.LabelFrame(self.manual_body, text="@" + row["username"], padding=10)
+        card.pack(fill="x", pady=7)
+        ai = "بله" if all(row[k] == 1 for k in ("is_fal_page", "is_daily", "is_text_based")) else "خیر/نامشخص"
+        title = f"{row['full_name'] or ''}   |   دنبال‌کننده: {row['followers'] or 0}   |   فعالیت: {row['active_days_7d'] or 0} روز   |   پیشنهاد AI: {ai}"
+        ttk.Label(card, text=title, font=FONT, anchor="e").pack(fill="x")
+        gallery = ttk.Frame(card); gallery.pack(fill="x", pady=6)
+        for index, path in enumerate(thumbnail_paths(row["thumbs"])):
+            try:
+                with Image.open(path) as original:
+                    preview = ImageOps.exif_transpose(original).convert("RGB")
+                    preview.thumbnail((300, 300))
+                    photo = ImageTk.PhotoImage(preview)
+                self.manual_images.append(photo)
+                button = ttk.Button(gallery, image=photo, command=lambda p=Path(path): self.open_path(p))
+                button.grid(row=index // 2, column=1 - index % 2, padx=5, pady=4)
+            except Exception:
+                ttk.Label(gallery, text="تصویر قابل نمایش نیست", font=FONT).grid(
+                    row=index // 2, column=1 - index % 2, padx=5, pady=4)
+        controls = ttk.Frame(card); controls.pack(fill="x")
+        selected = tk.BooleanVar(value=row["manual_decision"] == 1)
+        decision = tk.StringVar(value=self.manual_decision_text(row["manual_decision"]))
+        ttk.Label(controls, textvariable=decision, font=FONT).pack(side="left")
+        ttk.Button(controls, text="رد", command=lambda: self.save_manual(row["username"], 0, selected, decision)).pack(side="right", padx=5)
+        ttk.Button(controls, text="بررسی‌نشده", command=lambda: self.save_manual(row["username"], None, selected, decision)).pack(side="right", padx=5)
+        ttk.Checkbutton(controls, text="✓ صفحهٔ متنی موردنظر", variable=selected,
+                        command=lambda: self.save_manual(row["username"], 1 if selected.get() else None,
+                                                         selected, decision)).pack(side="right", padx=8)
+
+    @staticmethod
+    def manual_decision_text(value):
+        return "✓ انتخاب شد" if value == 1 else "✕ رد شد" if value == 0 else "در انتظار بررسی"
+
+    def save_manual(self, username, value, selected, decision):
+        try:
+            con = open_db()
+            try:
+                con.execute("UPDATE accounts SET manual_decision=?, manual_reviewed_at=? WHERE username=?",
+                            (value, datetime.now(timezone.utc).isoformat(timespec="seconds") if value is not None else None, username))
+                con.commit()
+                count = con.execute("SELECT COUNT(*) FROM accounts WHERE manual_decision=1").fetchone()[0]
+            finally:
+                con.close()
+            selected.set(value == 1)
+            decision.set(self.manual_decision_text(value))
+            self.manual_status.set(self.manual_status.get().split("  |  منتخب‌ها:")[0] + f"  |  منتخب‌ها: {count}")
+            self.refresh_status(repeat=False)
+        except Exception as e:
+            decision.set(f"ذخیره ناموفق بود: {e}")
+
+    def open_selected(self):
+        if self.proc:
+            return self.manual_status.set("پس از پایان اجرای فعلی خروجی بگیرید")
+        result = subprocess.run([PY, str(HERE / "pipeline.py"), "export"], cwd=HERE,
+                                env=dict(os.environ, PYTHONUTF8="1"), creationflags=NO_WINDOW,
+                                capture_output=True)
+        if result.returncode:
+            return self.manual_status.set("ساخت خروجی ناموفق بود")
+        self.open_path(HERE / "fal_pages.csv")
 
     # ================================================================ settings tab
     def build_settings(self, root):
@@ -208,21 +351,23 @@ class App(tk.Tk):
         self.save_lbl.config(foreground="#1a7f37" if ok else "#c62828")
 
     # ================================================================ status
-    def refresh_status(self):
+    def refresh_status(self, repeat=True):
         try:
             con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=1)
             c = dict(con.execute("SELECT status, COUNT(*) FROM accounts GROUP BY status").fetchall())
             fal = con.execute("SELECT COUNT(*) FROM accounts WHERE is_fal_page=1").fetchone()[0]
             good = con.execute("SELECT COUNT(*) FROM accounts WHERE is_fal_page=1 AND is_daily=1 AND is_text_based=1").fetchone()[0]
+            selected = con.execute("SELECT COUNT(*) FROM accounts WHERE manual_decision=1").fetchone()[0]
             con.close()
             total = sum(c.values())
             self.status_var.set(
                 f"کل صفحه‌ها: {total}   |   منتظر بررسی: {c.get('new', 0)}   |   منتظر دسته‌بندی: {c.get('enriched', 0)}"
                 f"   |   دسته‌بندی‌شده: {c.get('classified', 0)}\n"
-                f"صفحه‌ی فال: {fal}   |   ✅ فال روزانه‌ی متنی: {good}   |   خطا: {c.get('error', 0)}")
+                f"صفحه‌ی فال: {fal}   |   پیشنهاد AI: {good}   |   ✅ منتخب دستی: {selected}   |   خطا: {c.get('error', 0)}")
         except Exception:
             self.status_var.set("هنوز داده‌ای نیست - «اجرای کامل» را بزنید")
-        self.after(3000, self.refresh_status)
+        if repeat:
+            self.after(3000, self.refresh_status)
 
     # ================================================================ running
     def run(self, stage):
@@ -291,11 +436,20 @@ class App(tk.Tk):
 
     # ================================================================ files
     def open_results(self):
+        self.export_and_open("fal_pages.csv")
+
+    def open_all_results(self):
+        self.export_and_open("all_accounts.csv")
+
+    def export_and_open(self, filename):
         if self.proc:
             return self.write("صبر کنید کار فعلی تمام شود\n")
-        subprocess.run([PY, str(HERE / "pipeline.py"), "export"], cwd=HERE,
-                       env=dict(os.environ, PYTHONUTF8="1"), creationflags=NO_WINDOW, capture_output=True)
-        self.open_path(HERE / "all_accounts.csv")
+        result = subprocess.run([PY, str(HERE / "pipeline.py"), "export"], cwd=HERE,
+                                env=dict(os.environ, PYTHONUTF8="1"), creationflags=NO_WINDOW,
+                                capture_output=True)
+        if result.returncode:
+            return self.write("ساخت خروجی ناموفق بود\n")
+        self.open_path(HERE / filename)
 
     def open_path(self, p):
         if not p.exists():
