@@ -10,7 +10,7 @@ class EnrichTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        self.patches = [patch.object(p,'DB',root/'test.db'),patch.object(p,'THUMBS',root),patch.object(p,'CFG',{'posts_to_check':2,'posts_for_activity':12,'thumbnail_workers':2}),patch.object(p,'pause'),patch.object(p,'log'),patch.object(p,'summary')]
+        self.patches = [patch.object(p,'DB',root/'test.db'),patch.object(p,'THUMBS',root),patch.object(p,'CFG',{'posts_to_check':2,'posts_for_activity':12,'thumbnail_workers':2,'profile_workers':2}),patch.object(p,'pause'),patch.object(p,'log'),patch.object(p,'summary')]
         for x in self.patches:
             x.start(); self.addCleanup(x.stop)
         self.con=p.db(); self.addCleanup(self.con.close)
@@ -21,6 +21,7 @@ class EnrichTests(unittest.TestCase):
         self.client.user_info.return_value=self.info
         self.client.user_medias.return_value=self.medias
         x=patch.object(p,'ig',return_value=self.client); x.start(); self.addCleanup(x.stop)
+        x=patch.object(p,'make_enrich_client',return_value=self.client); x.start(); self.addCleanup(x.stop)
     def run_stage(self): p.enrich(self.con,S(limit=100))
     def test_parallel_download_and_checkpoint(self):
         barrier=threading.Barrier(2)
@@ -59,20 +60,14 @@ class EnrichTests(unittest.TestCase):
         self.client.reset_mock()
         with patch.object(p,'download_thumb',side_effect=lambda j:(j['path'],0)): self.run_stage()
         self.client.user_info.assert_not_called(); self.client.user_medias.assert_called_once()
-    def test_next_profile_overlaps_download(self):
+    def test_profile_requests_overlap(self):
         p.add_candidate(self.con,'bob','2','test'); self.con.commit()
-        entered=threading.Event(); next_profile=threading.Event()
+        barrier=threading.Barrier(2)
         def info(user_id):
-            if user_id=='2':
-                self.assertTrue(entered.wait(3))
-                next_profile.set()
+            barrier.wait(timeout=3)
             return self.info
-        def download(job):
-            entered.set()
-            if not next_profile.wait(3): raise RuntimeError('downloads blocked API')
-            return job['path'],0
         self.client.user_info.side_effect=info
-        with patch.object(p,'download_thumb',side_effect=download): self.run_stage()
+        with patch.object(p,'download_thumb',side_effect=lambda j:(j['path'],0)): self.run_stage()
         self.assertEqual(self.con.execute("select count(*) from accounts where status='enriched'").fetchone()[0],2)
     def test_atomic_cache_and_partial_cleanup(self):
         import requests
@@ -92,5 +87,15 @@ class EnrichTests(unittest.TestCase):
             with self.assertRaises(requests.ConnectionError): p.download_thumb(job)
         self.assertFalse(Path(job['path']).exists())
         self.assertFalse(Path(job['path']+'.part').exists())
+    def test_thumbnail_uses_configured_proxy(self):
+        p.CFG['proxy']='http://127.0.0.1:10808'
+        job={'url':'https://example.test/a.jpg','path':str(Path(self.tmp.name)/'image.jpg')}
+        response=unittest.mock.MagicMock()
+        response.__enter__.return_value=response
+        response.iter_content.return_value=iter([b'image'])
+        with patch('requests.get',return_value=response) as get:
+            p.download_thumb(job)
+            self.assertEqual(get.call_args.kwargs['proxies'],
+                             {'http':p.CFG['proxy'],'https':p.CFG['proxy']})
 
 if __name__=='__main__': unittest.main()

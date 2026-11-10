@@ -38,8 +38,8 @@ def _code_handler(username, choice):
 
 def get_client() -> Client:
     cl = Client()
-    d = float(CFG.get("delay_seconds", 1))
-    cl.delay_range = [0, d]          # pause between Instagram requests
+    d = float(CFG.get("delay_seconds", 0))
+    cl.delay_range = [0, d] if d > 0 else None
     if CFG.get("proxy"):
         cl.set_proxy(CFG["proxy"])   # e.g. http://127.0.0.1:10808 on Windows
     cl.challenge_code_handler = _code_handler

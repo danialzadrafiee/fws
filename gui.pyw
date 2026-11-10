@@ -11,14 +11,14 @@ FONT = ("Tahoma", 10)
 PY = sys.executable.replace("pythonw.exe", "python.exe")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-STAGE_FA = {"discover": "پیدا کردن صفحه‌ها", "enrich": "بررسی پروفایل‌ها", "classify": "دسته‌بندی با Haiku",
+STAGE_FA = {"discover": "پیدا کردن صفحه‌ها", "enrich": "بررسی پروفایل‌ها", "classify": "دسته‌بندی با AI",
             "expand": "صفحه‌های مشابه", "export": "ساختن خروجی"}
 
 STAGES = [
     ("all",      "▶  اجرای کامل",  "همه‌ی مراحل پشت سر هم، از پیدا کردن صفحه‌ها تا ساختن خروجی"),
     ("discover", "۱. پیدا کردن صفحه‌ها", "گشتن هشتگ‌ها و کلمه‌های جستجو؛ آن‌هایی که اخیراً گشته شده‌اند رد می‌شوند"),
     ("enrich",   "۲. بررسی پروفایل‌ها", "گرفتن فالوئر، فعالیت هفته و تصویر پست‌های آخرِ صفحه‌هایی که هنوز بررسی نشده‌اند"),
-    ("classify", "۳. دسته‌بندی با Haiku", "Haiku تصویرها را می‌خواند و تشخیص می‌دهد فال روزانه‌ی متنی است یا نه"),
+    ("classify", "۳. دسته‌بندی با AI", "مدل انتخاب‌شده تصویرها را می‌خواند و تشخیص می‌دهد فال روزانه‌ی متنی است یا نه"),
     ("expand",   "۴. صفحه‌های مشابه", "اضافه کردن صفحه‌های پیشنهادی اینستاگرام برای صفحه‌های فالِ تأییدشده"),
     ("export",   "۵. ساختن خروجی", "ساختن fal_pages.csv و all_accounts.csv"),
 ]
@@ -28,13 +28,18 @@ SETTINGS = [
     ("top_posts_per_hashtag", "پست‌های برتر هر هشتگ", "int", "اینستاگرام معمولاً حداکثر ۹ تا می‌دهد"),
     ("posts_per_hashtag", "پست‌های جدید هر هشتگ", "int", "بیشتر = صفحه‌ی بیشتر، ولی کندتر"),
     ("recheck_hours", "گشتن دوباره‌ی هر هشتگ بعد از (ساعت)", "float", "قبل از این زمان، هشتگ تکراری گشته نمی‌شود"),
-    ("posts_to_check", "تعداد پست آخر که Haiku می‌بیند", "int", "تصویر این تعداد پست دانلود می‌شود"),
+    ("posts_to_check", "تعداد پست آخر برای دسته‌بندی", "int", "تصویر این تعداد پست دانلود می‌شود"),
     ("posts_for_activity", "تعداد پست برای سنجش فعالیت هفته", "int", "فقط تاریخ‌شان خوانده می‌شود"),
     ("max_per_run", "حداکثر صفحه در هر اجرای هر مرحله", "int", "۰ = بدون محدودیت"),
     ("expand_from", "صفحه‌های مشابه از روی", "choice:fal=همه‌ی صفحه‌های فال,daily_text=فقط فال روزانه‌ی متنی", ""),
-    ("delay_seconds", "مکث بین درخواست‌ها (ثانیه)", "float", "اگر اینستاگرام محدودیت گذاشت بیشترش کنید"),
+    ("delay_seconds", "مکث بین درخواست‌ها (ثانیه)", "float", "۰ = بدون مکث؛ در صورت محدودیت افزایش دهید"),
+    ("profile_workers", "بررسی هم‌زمان پروفایل‌ها", "int", "بین ۱ تا ۸؛ پیش‌فرض ۸"),
     ("thumbnail_workers", "دانلود هم‌زمان تصاویر", "int", "بین ۱ تا ۴؛ پیش‌فرض ۳"),
-    ("classify_batch_size", "تعداد صفحه در هر درخواست Haiku", "int", ""),
+    ("classify_batch_size", "تعداد صفحه در هر درخواست AI", "int", "پیش‌فرض ۲۵ صفحه"),
+    ("classifier_provider", "سرویس دسته‌بندی", "choice:codex=Codex,claude=Claude", ""),
+    ("codex_model", "مدل Codex", "combo:gpt-6-luna,gpt-6.1-sol,gpt-6-astra", ""),
+    ("codex_reasoning_effort", "سطح فکر Codex", "combo:low,medium,high,xhigh,max", ""),
+    ("codex_cmd", "دستور اجرای Codex", "str", "معمولاً codex"),
     ("claude_model", "مدل Claude", "combo:haiku,sonnet,opus", ""),
     ("claude_cmd", "دستور اجرای Claude", "str", "معمولاً claude"),
     ("proxy", "پروکسی اینستاگرام", "str", "مثلاً http://127.0.0.1:10808 - خالی = بدون پروکسی"),
@@ -103,7 +108,15 @@ class App(tk.Tk):
 
     # ================================================================ settings tab
     def build_settings(self, root):
-        frm = ttk.Frame(root, padding=10); frm.pack(fill="both", expand=True)
+        canvas = tk.Canvas(root, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        frm = ttk.Frame(canvas, padding=10)
+        window = canvas.create_window((0, 0), window=frm, anchor="nw")
+        frm.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
 
         lists = ttk.Frame(frm); lists.pack(fill="x")
         self.list_boxes = {}
@@ -151,7 +164,7 @@ class App(tk.Tk):
         for key, t in self.list_boxes.items():
             t.delete("1.0", "end"); t.insert("1.0", "\n".join(cfg.get(key, [])))
         for key, (var, kind) in self.vars.items():
-            v = cfg.get(key, 3 if key == "thumbnail_workers" else "")
+            v = cfg.get(key, 3 if key == "thumbnail_workers" else 8 if key == "profile_workers" else "")
             if kind.startswith("choice:"):
                 v = var._map.get(v, next(iter(var._map.values())))
             elif kind == "float" and isinstance(v, float) and v.is_integer():
@@ -171,7 +184,8 @@ class App(tk.Tk):
                 try:
                     if kind == "int":
                         val = int(raw)
-                        if val < 0: raise ValueError
+                        if val < (1 if key in ("classify_batch_size", "profile_workers") else 0): raise ValueError
+                        if key == "profile_workers" and val > 8: raise ValueError
                     elif kind == "float":
                         val = float(raw)
                         if val < 0: raise ValueError
@@ -203,7 +217,7 @@ class App(tk.Tk):
             con.close()
             total = sum(c.values())
             self.status_var.set(
-                f"کل صفحه‌ها: {total}   |   منتظر بررسی: {c.get('new', 0)}   |   منتظر Haiku: {c.get('enriched', 0)}"
+                f"کل صفحه‌ها: {total}   |   منتظر بررسی: {c.get('new', 0)}   |   منتظر دسته‌بندی: {c.get('enriched', 0)}"
                 f"   |   دسته‌بندی‌شده: {c.get('classified', 0)}\n"
                 f"صفحه‌ی فال: {fal}   |   ✅ فال روزانه‌ی متنی: {good}   |   خطا: {c.get('error', 0)}")
         except Exception:

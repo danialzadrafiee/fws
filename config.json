@@ -25,12 +25,18 @@
   "posts_per_hashtag": 30,
   "recheck_hours": 12.0,
   "posts_to_check": 2,
-  "posts_for_activity": 12,
+  "posts_for_activity": 2,
   "max_per_run": 0,
   "expand_from": "fal",
-  "delay_seconds": 1.0,
-  "classify_batch_size": 5,
+  "delay_seconds": 0.0,
+  "classify_batch_size": 25,
+  "classifier_provider": "codex",
+  "codex_cmd": "codex",
+  "codex_model": "gpt-6-luna",
+  "codex_reasoning_effort": "low",
+  "profile_workers": 8,
   "claude_cmd": "claude",
   "claude_model": "haiku",
-  "claude_extra_args": []
+  "claude_extra_args": [],
+  "thumbnail_workers": 3
 }
