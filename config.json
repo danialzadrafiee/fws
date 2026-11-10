@@ -1,0 +1,31 @@
+{
+  "username": "aura_taroot",
+  "password": "WTFIS0124",
+  "proxy": "http://127.0.0.1:10808",
+  "hashtags": [
+    "فال_روزانه",
+    "فال_روز",
+    "فال_امروز",
+    "فال_ماه_تولد",
+    "فال_تاروت",
+    "طالع_بینی",
+    "فال_حافظ",
+    "فال_ابجد",
+    "فال_انرژی",
+    "فال_هفتگی"
+  ],
+  "search_keywords": [
+    "فال روزانه",
+    "فال",
+    "تاروت",
+    "fal",
+    "faal"
+  ],
+  "posts_per_hashtag": 30,
+  "classify_batch_size": 5,
+  "claude_cmd": "claude",
+  "claude_model": "haiku",
+  "claude_extra_args": [],
+  "delay_seconds": 1,
+  "posts_to_check": 2
+}
