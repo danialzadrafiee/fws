@@ -16,6 +16,8 @@ Options: --limit N (overrides max_per_run), --force (re-search hashtags searched
 import json, sqlite3, subprocess, sys, time, random, re, argparse, csv, shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from urllib.parse import urlparse
 
 HERE = Path(__file__).resolve().parent
 CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
@@ -41,6 +43,9 @@ def db():
         con.execute("ALTER TABLE accounts ADD COLUMN thumbs TEXT")
     if "active_days_7d" not in cols:
         con.execute("ALTER TABLE accounts ADD COLUMN active_days_7d INTEGER")
+    for name, kind in (("enrich_stage", "TEXT"), ("thumb_jobs", "TEXT")):
+        if name not in cols:
+            con.execute(f"ALTER TABLE accounts ADD COLUMN {name} {kind}")
     con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
     return con
 
@@ -154,59 +159,152 @@ def _thumb_url(m):
             return str(r.thumbnail_url)
     return None
 
+def download_thumb(job):
+    """Independent CDN request; never share the Instagram client across threads."""
+    import requests
+    started = time.perf_counter()
+    path = Path(job["path"])
+    if path.exists() and path.stat().st_size:
+        return str(path.resolve()), 0.0
+    temp = path.with_suffix(path.suffix + ".part")
+    try:
+        with requests.get(job["url"], stream=True, timeout=(10, 30)) as response:
+            response.raise_for_status()
+            with temp.open("wb") as out:
+                for chunk in response.iter_content(65536):
+                    out.write(chunk)
+        if not temp.stat().st_size:
+            raise ValueError("empty thumbnail")
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return str(path.resolve()), time.perf_counter() - started
+
+
 def enrich(con, args):
-    n_check = int(CFG.get("posts_to_check", 2))
-    # new accounts, plus ones enriched by the old version (no thumbnails yet)
-    rows = con.execute("""SELECT username,user_id FROM accounts
-        WHERE status='new' OR (status='enriched' AND thumbs IS NULL) LIMIT ?""", (args.limit,)).fetchall()
+    n_check = max(1, int(CFG.get("posts_to_check", 2)))
+    workers = max(1, min(4, int(CFG.get("thumbnail_workers", 3))))
+    rows = con.execute("""SELECT * FROM accounts
+        WHERE status='new' OR (status='enriched' AND thumbs IS NULL)
+        OR (status='error' AND enrich_stage IN ('profile','media')) LIMIT ?""",
+        (args.limit,)).fetchall()
     if not rows:
         return summary("صفحه‌ای منتظر بررسی نیست")
-    cl = ig(); THUMBS.mkdir(exist_ok=True)
-    log(f"{len(rows)} صفحه در صف بررسی (۲ پست آخر هر کدام)")
-    ok = 0
-    for i, r in enumerate(rows, 1):
-        progress(i - 1, len(rows))
-        try:
-            info = cl.user_info(r["user_id"]) if r["user_id"] else cl.user_info_by_username(r["username"])
-            caps, times, photos, thumbs, latest = [], [], 0, [], []
-            if not info.is_private and info.media_count:
-                # one request returns several posts; sort by date so pinned old posts don't count as "latest"
-                medias = sorted(cl.user_medias(info.pk, amount=int(CFG.get("posts_for_activity", 12))), key=lambda m: m.taken_at, reverse=True)
-                times = [m.taken_at for m in medias if m.taken_at]
-                latest = medias[:n_check]
-                for k, m in enumerate(latest):
-                    caps.append((m.caption_text or "")[:300])
-                    if m.media_type in (1, 8): photos += 1      # 1 photo, 8 carousel, 2 video/reel
-                    url = _thumb_url(m)
-                    if url:
-                        try:
-                            fp = cl.photo_download_by_url(url, f"{r['username']}_{k}", THUMBS)
-                            thumbs.append(str(Path(fp).resolve()))
-                        except Exception as e:
-                            log(f"   thumb {k} failed: {type(e).__name__}")
-            # posts in the last 7 days and on how many different days (pages often post 12 months at once)
-            week = [t for t in times if (datetime.now(timezone.utc) - t).days < 7]
-            ppw = len(week)
-            active_days = len({t.date() for t in week})
-            share = round(photos / len(latest), 2) if latest else None
-            con.execute("""UPDATE accounts SET user_id=?, full_name=?, bio=?, followers=?, following=?,
-                media_count=?, is_private=?, external_url=?, last_post_at=?, posts_per_week=?,
-                photo_share=?, recent_captions=?, thumbs=?, active_days_7d=?, status='enriched', error=NULL WHERE username=?""",
-                (str(info.pk), info.full_name, info.biography, info.follower_count, info.following_count,
-                 info.media_count, int(info.is_private), str(info.external_url or ""),
-                 max(times).isoformat() if times else None, ppw, share,
-                 json.dumps(caps, ensure_ascii=False), json.dumps(thumbs), active_days, r["username"]))
+    THUMBS.mkdir(exist_ok=True)
+    log(f"{len(rows)} صفحه در صف بررسی؛ {workers} دانلود هم‌زمان")
+    started = time.perf_counter()
+    pending = {}
+    done = ok = 0
+
+    def collect(block=False):
+        nonlocal done, ok
+        futures = [f for _, fs in pending.values() for f in fs]
+        if block and futures:
+            wait(futures, return_when=FIRST_COMPLETED)
+        for username, (jobs, fs) in list(pending.items()):
+            if not all(f.done() for f in fs):
+                continue
+            paths, errors, seconds = [], [], 0.0
+            refresh_urls = False
+            for f in fs:
+                try:
+                    path, elapsed = f.result()
+                    paths.append(path)
+                    seconds += elapsed
+                except Exception as e:
+                    errors.append(f"{type(e).__name__}: {e}")
+                    if getattr(getattr(e, "response", None), "status_code", None) in (403, 404):
+                        refresh_urls = True
+            # Failed images stay retryable; successful atomic files are reused.
+            con.execute("""UPDATE accounts SET thumbs=?, status=?, error=? WHERE username=?""",
+                        (json.dumps(paths), 'new' if errors else 'enriched',
+                         '; '.join(errors)[:300] if errors else None, username))
+            if refresh_urls:
+                con.execute("UPDATE accounts SET enrich_stage='profile' WHERE username=?", (username,))
             con.commit()
-            ok += 1
-            log(f"[{i}/{len(rows)}] {r['username']}: {info.follower_count} followers, {ppw} posts on {active_days} days this week, {len(thumbs)} thumbs")
-        except Exception as e:
-            log(f"[{i}/{len(rows)}] {r['username']}: {type(e).__name__}: {e}")
-            if is_fatal(e): return throttled()
-            con.execute("UPDATE accounts SET status='error', error=? WHERE username=?", (str(e)[:300], r["username"]))
-            con.commit()
-        pause()
-    progress(len(rows), len(rows))
-    summary(f"بررسی تمام شد: {ok} از {len(rows)} صفحه بررسی شد")
+            done += 1
+            ok += not errors
+            log(f"{username}: images={len(paths)}/{len(jobs)}, download_worker_seconds={seconds:.1f}"
+                + (f"; retry pending: {errors[0]}" if errors else ""))
+            progress(done, len(rows))
+            del pending[username]
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for r in rows:
+            collect()
+            # Bound queued work while allowing API calls to overlap downloads.
+            while len(pending) >= workers * 2:
+                collect(block=True)
+            username = r["username"]
+            profile_seconds = media_seconds = 0.0
+            requested = False
+            try:
+                data = dict(r)
+                if data["enrich_stage"] not in ('profile', 'media'):
+                    t = time.perf_counter()
+                    cl = ig()
+                    requested = True
+                    info = cl.user_info(r["user_id"]) if r["user_id"] else cl.user_info_by_username(username)
+                    con.execute("""UPDATE accounts SET user_id=?, full_name=?, bio=?, followers=?,
+                        following=?, media_count=?, is_private=?, external_url=?,
+                        enrich_stage='profile', status='new', error=NULL WHERE username=?""",
+                        (str(info.pk), info.full_name, info.biography, info.follower_count,
+                         info.following_count, info.media_count, int(info.is_private),
+                         str(info.external_url or ""), username))
+                    con.commit()
+                    data = dict(con.execute("SELECT * FROM accounts WHERE username=?", (username,)).fetchone())
+                    profile_seconds = time.perf_counter() - t
+                if data["enrich_stage"] != 'media':
+                    t = time.perf_counter()
+                    medias = []
+                    if not data["is_private"] and data["media_count"]:
+                        requested = True
+                        medias = ig().user_medias(data["user_id"], amount=max(n_check, int(CFG.get("posts_for_activity", 12))))
+                    medias = sorted((m for m in medias if m.taken_at), key=lambda m: m.taken_at, reverse=True)
+                    times = [m.taken_at for m in medias]
+                    latest = medias[:n_check]
+                    caps = [(m.caption_text or "")[:300] for m in latest]
+                    photos = sum(m.media_type in (1, 8) for m in latest)
+                    jobs = []
+                    for k, m in enumerate(latest):
+                        url = _thumb_url(m)
+                        if url:
+                            suffix = Path(urlparse(url).path).suffix.lower()
+                            if suffix not in ('.jpg', '.jpeg', '.png', '.webp', '.heic'):
+                                suffix = '.jpg'
+                            # Media identity avoids reusing a different post's cached image.
+                            import hashlib
+                            identity = hashlib.sha256(str(m.pk).encode()).hexdigest()[:16]
+                            jobs.append({"url": url, "path": str((THUMBS / f"{username}_{k}_{identity}{suffix}").resolve())})
+                    week = [t for t in times if 0 <= (datetime.now(timezone.utc) - t).total_seconds() < 7 * 86400]
+                    con.execute("""UPDATE accounts SET last_post_at=?, posts_per_week=?, photo_share=?,
+                        recent_captions=?, active_days_7d=?, thumb_jobs=?, enrich_stage='media',
+                        status='new', error=NULL WHERE username=?""",
+                        (max(times).isoformat() if times else None, len(week),
+                         round(photos / len(latest), 2) if latest else None,
+                         json.dumps(caps, ensure_ascii=False), len({t.date() for t in week}),
+                         json.dumps(jobs), username))
+                    con.commit()
+                    media_seconds = time.perf_counter() - t
+                else:
+                    jobs = json.loads(data["thumb_jobs"] or '[]')
+                pending[username] = (jobs, [pool.submit(download_thumb, job) for job in jobs])
+                log(f"{username}: profile={profile_seconds:.1f}s, posts={media_seconds:.1f}s; images queued")
+            except Exception as e:
+                log(f"{username}: {type(e).__name__}: {e}")
+                if is_fatal(e):
+                    throttled()
+                    break
+                con.execute("UPDATE accounts SET status='error', error=? WHERE username=?", (str(e)[:300], username))
+                con.commit()
+                done += 1
+                progress(done, len(rows))
+            if requested:
+                pause()
+        while pending:
+            collect(block=True)
+    summary(f"بررسی تمام شد: {ok} از {len(rows)} صفحه؛ زمان کل {time.perf_counter() - started:.1f} ثانیه")
+
 
 def expand(con, args):
     new = 0

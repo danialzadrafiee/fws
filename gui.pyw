@@ -33,6 +33,7 @@ SETTINGS = [
     ("max_per_run", "حداکثر صفحه در هر اجرای هر مرحله", "int", "۰ = بدون محدودیت"),
     ("expand_from", "صفحه‌های مشابه از روی", "choice:fal=همه‌ی صفحه‌های فال,daily_text=فقط فال روزانه‌ی متنی", ""),
     ("delay_seconds", "مکث بین درخواست‌ها (ثانیه)", "float", "اگر اینستاگرام محدودیت گذاشت بیشترش کنید"),
+    ("thumbnail_workers", "دانلود هم‌زمان تصاویر", "int", "بین ۱ تا ۴؛ پیش‌فرض ۳"),
     ("classify_batch_size", "تعداد صفحه در هر درخواست Haiku", "int", ""),
     ("claude_model", "مدل Claude", "combo:haiku,sonnet,opus", ""),
     ("claude_cmd", "دستور اجرای Claude", "str", "معمولاً claude"),
@@ -150,7 +151,7 @@ class App(tk.Tk):
         for key, t in self.list_boxes.items():
             t.delete("1.0", "end"); t.insert("1.0", "\n".join(cfg.get(key, [])))
         for key, (var, kind) in self.vars.items():
-            v = cfg.get(key, "")
+            v = cfg.get(key, 3 if key == "thumbnail_workers" else "")
             if kind.startswith("choice:"):
                 v = var._map.get(v, next(iter(var._map.values())))
             elif kind == "float" and isinstance(v, float) and v.is_integer():
