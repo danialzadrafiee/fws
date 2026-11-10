@@ -10,7 +10,8 @@ Fal-page finder pipeline.
   python pipeline.py status     # counts
 
 Everything is stored in fal.db (SQLite), so every stage can be re-run safely and
-only does new work. Options: --limit N (max accounts per enrich/classify/expand run).
+only does new work. All settings live in config.json (editable from gui.pyw -> تنظیمات).
+Options: --limit N (overrides max_per_run), --force (re-search hashtags searched recently).
 """
 import json, sqlite3, subprocess, sys, time, random, re, argparse, csv, shutil
 from datetime import datetime, timezone
@@ -58,11 +59,29 @@ def log(*a):
 
 THUMBS = HERE / "thumbs"
 
+# lines starting with @@ are read by gui.pyw (stage / progress bar); hidden in the plain console
+GUI = os.environ.get("FAL_GUI") == "1"
+def stage(idx, total, name):
+    if GUI: print(f"@@STAGE {idx} {total} {name}", flush=True)
+
+def progress(done, total):
+    if GUI: print(f"@@PROGRESS {done} {total}", flush=True)
+
+def summary(text):
+    log("✔ " + text)
+
+THROTTLED = False
+def throttled():
+    global THROTTLED
+    THROTTLED = True
+    log("STOP: Instagram is throttling, try again later.")
+    summary("اینستاگرام محدودیت گذاشت؛ کمی بعد دوباره اجرا کنید")
+
 def pause():
     time.sleep(float(CFG.get("delay_seconds", 1)))
 
 # remember when each hashtag / keyword was last searched, so re-runs don't repeat it
-RECHECK_HOURS = 12
+RECHECK_HOURS = float(CFG.get("recheck_hours", 12))
 
 def recently_done(con, key, args):
     if getattr(args, "force", False):
@@ -94,20 +113,22 @@ def discover(con, args):
     if skipped:
         log(f"{skipped} hashtags/keywords were searched in the last {RECHECK_HOURS}h -> skipped")
     if not todo_tags and not todo_kws:
-        return log("nothing to discover")
-    cl = ig(); new = 0
+        return summary(f"همه‌ی هشتگ‌ها در {RECHECK_HOURS} ساعت اخیر گشته شده‌اند؛ چیزی برای گشتن نیست")
+    cl = ig(); new = 0; step = 0; steps = len(todo_tags) * 2 + len(todo_kws)
+    log(f"{len(todo_tags)} هشتگ و {len(todo_kws)} کلمه برای گشتن")
     for tag in todo_tags:
         for kind, fn in (("top", cl.hashtag_medias_top), ("recent", cl.hashtag_medias_recent)):
             try:
-                amount = 9 if kind == "top" else CFG["posts_per_hashtag"]
+                amount = int(CFG.get("top_posts_per_hashtag", 9)) if kind == "top" else int(CFG.get("posts_per_hashtag", 30))
                 medias = fn(tag, amount=amount)
             except Exception as e:
                 log(f"  #{tag} {kind}: {type(e).__name__}: {e}")
-                if is_fatal(e): return log("STOP: Instagram is throttling, try again later.")
+                if is_fatal(e): return throttled()
                 continue
             n = sum(add_candidate(con, m.user.username, m.user.pk, f"#{tag}") for m in medias)
             con.commit(); new += n
             log(f"#{tag} [{kind}] {len(medias)} posts from {len({m.user.username for m in medias})} pages -> {n} new pages added")
+            step += 1; progress(step, steps)
             pause()
         mark_done(con, f"tag:{tag}")
     for kw in todo_kws:
@@ -115,14 +136,15 @@ def discover(con, args):
             users = cl.search_users(kw)
         except Exception as e:
             log(f"  search '{kw}': {type(e).__name__}: {e}")
-            if is_fatal(e): return log("STOP: Instagram is throttling, try again later.")
+            if is_fatal(e): return throttled()
             continue
         n = sum(add_candidate(con, u.username, u.pk, f"search:{kw}") for u in users)
         con.commit(); new += n
         log(f"search '{kw}' {len(users)} pages -> {n} new pages added")
+        step += 1; progress(step, steps)
         mark_done(con, f"kw:{kw}")
         pause()
-    log(f"discover done: +{new} new candidates")
+    summary(f"پیدا کردن تمام شد: {new} صفحه‌ی جدید به لیست اضافه شد")
 
 def _thumb_url(m):
     if m.thumbnail_url:
@@ -133,19 +155,23 @@ def _thumb_url(m):
     return None
 
 def enrich(con, args):
-    cl = ig(); THUMBS.mkdir(exist_ok=True)
     n_check = int(CFG.get("posts_to_check", 2))
     # new accounts, plus ones enriched by the old version (no thumbnails yet)
     rows = con.execute("""SELECT username,user_id FROM accounts
         WHERE status='new' OR (status='enriched' AND thumbs IS NULL) LIMIT ?""", (args.limit,)).fetchall()
-    log(f"enriching {len(rows)} accounts (latest {n_check} posts each)")
+    if not rows:
+        return summary("صفحه‌ای منتظر بررسی نیست")
+    cl = ig(); THUMBS.mkdir(exist_ok=True)
+    log(f"{len(rows)} صفحه در صف بررسی (۲ پست آخر هر کدام)")
+    ok = 0
     for i, r in enumerate(rows, 1):
+        progress(i - 1, len(rows))
         try:
             info = cl.user_info(r["user_id"]) if r["user_id"] else cl.user_info_by_username(r["username"])
             caps, times, photos, thumbs, latest = [], [], 0, [], []
             if not info.is_private and info.media_count:
                 # one request returns several posts; sort by date so pinned old posts don't count as "latest"
-                medias = sorted(cl.user_medias(info.pk, amount=12), key=lambda m: m.taken_at, reverse=True)
+                medias = sorted(cl.user_medias(info.pk, amount=int(CFG.get("posts_for_activity", 12))), key=lambda m: m.taken_at, reverse=True)
                 times = [m.taken_at for m in medias if m.taken_at]
                 latest = medias[:n_check]
                 for k, m in enumerate(latest):
@@ -171,20 +197,27 @@ def enrich(con, args):
                  max(times).isoformat() if times else None, ppw, share,
                  json.dumps(caps, ensure_ascii=False), json.dumps(thumbs), active_days, r["username"]))
             con.commit()
+            ok += 1
             log(f"[{i}/{len(rows)}] {r['username']}: {info.follower_count} followers, {ppw} posts on {active_days} days this week, {len(thumbs)} thumbs")
         except Exception as e:
             log(f"[{i}/{len(rows)}] {r['username']}: {type(e).__name__}: {e}")
-            if is_fatal(e): return log("STOP: Instagram is throttling, try again later.")
+            if is_fatal(e): return throttled()
             con.execute("UPDATE accounts SET status='error', error=? WHERE username=?", (str(e)[:300], r["username"]))
             con.commit()
         pause()
+    progress(len(rows), len(rows))
+    summary(f"بررسی تمام شد: {ok} از {len(rows)} صفحه بررسی شد")
 
 def expand(con, args):
-    cl = ig(); new = 0
-    rows = con.execute("SELECT username,user_id FROM accounts WHERE is_fal_page=1 AND expanded=0 LIMIT ?",
+    new = 0
+    where = "is_fal_page=1 AND is_daily=1 AND is_text_based=1" if CFG.get("expand_from") == "daily_text" else "is_fal_page=1"
+    rows = con.execute(f"SELECT username,user_id FROM accounts WHERE {where} AND expanded=0 LIMIT ?",
                        (args.limit,)).fetchall()
-    log(f"expanding {len(rows)} confirmed fal pages")
-    for r in rows:
+    if not rows:
+        return summary("صفحه‌ی تأییدشده‌ی جدیدی برای گشتن مشابه‌ها نیست")
+    cl = ig()
+    log(f"گشتن صفحه‌های مشابه برای {len(rows)} صفحه‌ی فال")
+    for j, r in enumerate(rows, 1):
         found = []
         for fn in (cl.chaining, cl.fbsearch_suggested_profiles, cl.user_related_profiles_gql):
             try:
@@ -192,13 +225,14 @@ def expand(con, args):
                 found = [(u.username, u.pk) for u in res]
                 if found: break
             except Exception as e:
-                if is_fatal(e): return log("STOP: Instagram is throttling, try again later.")
+                if is_fatal(e): return throttled()
         n = sum(add_candidate(con, u, pk, f"similar:{r['username']}") for u, pk in found)
         con.execute("UPDATE accounts SET expanded=1 WHERE username=?", (r["username"],))
         con.commit(); new += n
         log(f"{r['username']}: {len(found)} similar -> +{n} new")
+        progress(j, len(rows))
         pause()
-    log(f"expand done: +{new} new candidates")
+    summary(f"صفحه‌های مشابه تمام شد: {new} صفحه‌ی جدید به لیست اضافه شد")
 
 # ---------------------------------------------------------------- haiku
 PROMPT = """You classify Instagram accounts for a research list of Persian "daily fortune" (فال روزانه) pages.
@@ -243,7 +277,10 @@ def call_haiku(prompt):
 def classify(con, args):
     rows = con.execute("SELECT * FROM accounts WHERE status='enriched' LIMIT ?", (args.limit,)).fetchall()
     bs = CFG["classify_batch_size"]
-    log(f"classifying {len(rows)} accounts in batches of {bs} with {CFG['claude_model']}")
+    if not rows:
+        return summary("صفحه‌ای منتظر Haiku نیست")
+    log(f"{len(rows)} صفحه در صف Haiku (دسته‌های {bs}تایی)")
+    tot_lab = tot_hits = 0
     for i in range(0, len(rows), bs):
         batch = rows[i:i + bs]
         payload = [{
@@ -258,6 +295,7 @@ def classify(con, args):
             results = call_haiku(PROMPT + json.dumps(payload, ensure_ascii=False, indent=1))
         except Exception as e:
             log(f"batch {i // bs + 1}: {type(e).__name__}: {e}")
+            progress(min(i + bs, len(rows)), len(rows))
             continue
         by_user = {x.get("username"): x for x in results if isinstance(x, dict)}
         for r in batch:
@@ -269,7 +307,10 @@ def classify(con, args):
                  ",".join(x.get("fal_types") or []), x.get("confidence"), x.get("reason"), r["username"]))
         con.commit()
         hits = sum(1 for x in by_user.values() if x.get("is_fal_page") and x.get("is_daily") and x.get("is_text_based"))
+        tot_lab += len(by_user); tot_hits += hits
         log(f"batch {i // bs + 1}: {len(by_user)}/{len(batch)} labeled, {hits} daily text fal pages")
+        progress(min(i + bs, len(rows)), len(rows))
+    summary(f"دسته‌بندی تمام شد: {tot_lab} صفحه دسته‌بندی شد، {tot_hits} فال روزانه‌ی متنی")
 
 # ---------------------------------------------------------------- output
 COLS = ["username", "full_name", "followers", "active_days_7d", "posts_per_week", "photo_share", "last_post_at",
@@ -282,8 +323,10 @@ def export(con, args):
             w = csv.writer(f); w.writerow(COLS + ["link"])
             for r in rows: w.writerow(list(r) + [f"https://instagram.com/{r['username']}"])
         log(f"{name}: {len(rows)} rows")
-    write("fal_pages.csv", "WHERE is_fal_page=1 AND is_daily=1 AND is_text_based=1")
-    write("all_accounts.csv", "")
+        return len(rows)
+    a = write("fal_pages.csv", "WHERE is_fal_page=1 AND is_daily=1 AND is_text_based=1")
+    b = write("all_accounts.csv", "")
+    summary(f"خروجی ساخته شد: {a} فال روزانه‌ی متنی در fal_pages.csv، {b} صفحه در all_accounts.csv")
 
 def status(con, args):
     for r in con.execute("SELECT status, COUNT(*) n FROM accounts GROUP BY status"):
@@ -297,18 +340,31 @@ STAGE_FA = {"discover": "پیدا کردن صفحه‌های جدید از هش�
             "expand": "پیدا کردن صفحه‌های مشابه صفحه‌های تأییدشده",
             "export": "ساختن فایل‌های CSV"}
 
+IG_STAGES = ("discover", "enrich", "expand")
+
 def run_all(con, args):
-    for f in (discover, enrich, classify, expand, enrich, classify, export):
-        log(f"===== {f.__name__}: {STAGE_FA[f.__name__]}"); f(con, args)
+    seq = (discover, enrich, classify, expand, enrich, classify, export)
+    for k, f in enumerate(seq, 1):
+        stage(k, len(seq), f.__name__)
+        log(f"===== {k}/{len(seq)} {f.__name__}: {STAGE_FA[f.__name__]}")
+        if THROTTLED and f.__name__ in IG_STAGES:
+            summary("رد شد چون اینستاگرام محدودیت گذاشته"); continue
+        f(con, args)
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("stage", choices=["discover", "enrich", "classify", "expand", "export", "all", "status"])
-    ap.add_argument("--limit", type=int, default=200)
+    ap.add_argument("--limit", type=int, default=int(CFG.get("max_per_run", 0)),
+                    help="max accounts per enrich/classify/expand run (0 = no limit)")
     ap.add_argument("--force", "--rediscover", dest="force", action="store_true",
                     help="search hashtags/keywords again even if done in the last 12h")
     a = ap.parse_args()
-    {"discover": discover, "enrich": enrich, "classify": classify, "expand": expand,
-     "export": export, "all": run_all, "status": status}[a.stage](db(), a)
+    if a.limit <= 0:
+        a.limit = 10 ** 9
+    fns = {"discover": discover, "enrich": enrich, "classify": classify, "expand": expand,
+           "export": export, "all": run_all, "status": status}
+    if a.stage not in ("all", "status"):
+        stage(1, 1, a.stage)
+    fns[a.stage](db(), a)
